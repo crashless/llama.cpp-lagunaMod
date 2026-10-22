@@ -22,6 +22,9 @@ struct llama_memory_params {
     // use full-size SWA cache
     bool swa_full;
 
+    // stored SWA cell count, 0 = use default
+    int n_swa_cache;
+
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;

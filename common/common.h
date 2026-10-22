@@ -576,8 +576,9 @@ struct common_params {
     bool no_perf           = false; // disable performance metrics
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
-    bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
-    bool kv_unified        = false; // enable unified KV cache
+    bool   swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+    int    n_swa_cache       = 0;    // stored SWA cell count, 0 = use default
+    bool   kv_unified        = false; // enable unified KV cache
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

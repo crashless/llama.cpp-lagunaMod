@@ -1031,6 +1031,12 @@ public:
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
+    // fire-once [[pin]] marker state for donor slot assignment
+    bool pin_armed = true;
+    int  donor_slot = -1;
+    bool pending_pin_donor = false;
+    server_tokens donor_tokens;
+
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
@@ -1776,12 +1782,15 @@ private:
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
-                // a busy slot is returned untouched, the caller defers the task
-                if (ret->is_processing()) {
+                if (ret->id == donor_slot) {
+                    // donor slot is never selected directly
+                    ret = nullptr;
+                } else if (ret->is_processing()) {
+                    // a busy slot is returned untouched, the caller defers the task
                     return ret;
+                } else {
+                    SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
                 }
-
-                SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
             }
         }
 
@@ -1791,6 +1800,11 @@ private:
 
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
+                    continue;
+                }
+
+                // never select the donor slot
+                if (slot.id == donor_slot) {
                     continue;
                 }
 
@@ -1889,6 +1903,10 @@ private:
         }
 
         for (auto & slot : slots) {
+            if (slot.id == donor_slot) {
+                continue;
+            }
+
             if (slot.is_processing()) {
                 continue;
             }
@@ -2597,7 +2615,7 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            if (!slot.is_processing() && slot.id != exclude_id_slot && slot.id != donor_slot) {
                 free_slots.push_back(&slot);
             }
         }
@@ -3008,6 +3026,9 @@ private:
 
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
+                            if (slot.id == donor_slot) {
+                                continue;
+                            }
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
@@ -3664,6 +3685,14 @@ private:
 
                 n_keep = std::min(slot.n_ctx - 4, n_keep);
 
+                // guard: protect donor prefix cells from being shifted
+                if (donor_slot >= 0 && slot.prompt.n_tokens() > 0) {
+                    const size_t n_donor_prefix = slot.prompt.tokens.get_common_prefix(donor_tokens);
+                    if (n_donor_prefix > 0 && n_keep < (int) n_donor_prefix) {
+                        n_keep = (int) n_donor_prefix;
+                    }
+                }
+
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
                 int       n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
 
@@ -4049,6 +4078,23 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                            }
+
+                            // donor prefix reuse (kv_unified only, fresh slot)
+                            if (n_past == 0 && params_base.kv_unified && donor_slot >= 0) {
+                                const size_t lcp_len = donor_tokens.get_common_prefix(input_tokens);
+                                if (lcp_len >= donor_tokens.size() - 1 && lcp_len > 0) {
+                                    const size_t n_copy = lcp_len - 1; // leave 1 token for the worker
+                                    if (n_copy > 0) {
+                                        slot.mem.seq_cp(donor_slot, slot.id, 0, (llama_pos) n_copy);
+                                        for (size_t i = 0; i < n_copy; i++) {
+                                            slot.prompt.tokens.push_back(input_tokens[i]);
+                                        }
+                                    }
+                                    n_past = (int) n_copy;
+                                    SLT_INF(slot, "donor reuse: donor slot=%d, lcp=%zu, worker slot=%d\n",
+                                            donor_slot, lcp_len, slot.id);
+                                }
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
@@ -4696,6 +4742,17 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                // pin_donor: store prefix in this slot as the donor, skip generation
+                if (slot.task->pin_donor) {
+                    donor_slot = slot.id;
+                    donor_tokens = slot.task->tokens.clone();
+                    SLT_INF(slot, "donor slot=%d, n_tokens=%zu\n", slot.id, donor_tokens.size());
+                    send_final_response(slot);
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch.view);
@@ -5189,6 +5246,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     try {
         std::vector<server_task> tasks;
 
+        // read and clear pending pin-donor flag (set by [[pin]] scanner in post_chat_completions)
+        const bool pin_donor = ctx_server.pending_pin_donor;
+        ctx_server.pending_pin_donor = false;
+
         const auto & prompt = data.at("prompt");
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
@@ -5229,6 +5290,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.apply_chat_session(chat_session);
+
+            if (pin_donor) {
+                task.pin_donor = true;
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -5860,6 +5925,55 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+
+        // fire-once [[pin]]: scan system messages only while armed, strip before template
+        if (ctx_server.pin_armed && body.contains("messages") && body.at("messages").is_array()) {
+            auto & messages = body.at("messages");
+            auto strip_pin = [](std::string & s) -> bool {
+                size_t pos = s.rfind("[[pin]]");
+                if (pos == std::string::npos) return false;
+                s.erase(pos, 7); // "[[pin]]" is 7 chars
+                if (pos > 0 && pos < s.size() && s[pos-1] == ' ' && s[pos] == ' ') {
+                    s.erase(pos, 1); // remove adjacent space if double
+                }
+                return true;
+            };
+            for (size_t i = 0; i < messages.size(); i++) {
+                auto & msg = messages[i];
+                if (msg.value("role", std::string()) != "system") continue;
+                if (!msg.contains("content")) continue;
+                auto & content = msg["content"];
+                bool found = false;
+                if (content.is_string()) {
+                    std::string s = content.get<std::string>();
+                    if (strip_pin(s)) {
+                        content = s;
+                        found = true;
+                    }
+                } else if (content.is_array()) {
+                    for (auto & part : content) {
+                        if (part.value("type", std::string()) != "text") continue;
+                        if (!part.contains("text") || !part.at("text").is_string()) continue;
+                        std::string s = part.at("text").get<std::string>();
+                        if (strip_pin(s)) {
+                            part.at("text") = s;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (found) {
+                    bool drop = content.is_string() && content.get<std::string>().empty();
+                    if (drop) {
+                        messages.erase(i);
+                    }
+                    ctx_server.pin_armed = false;
+                    ctx_server.pending_pin_donor = true;
+                    break; // fire-once: stop scanning after first hit
+                }
+            }
+        }
+
         common_chat_session session;
         json body_parsed = oaicompat_chat_params_parse(
             ctx_server.vocab,

@@ -1698,6 +1698,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
+        {"--swa-cache"}, "N",
+        string_format("stored SWA cell count (default: %d = use n_swa)\n"
+                     "Note: the attention mask stays at n_swa, this only grows the stored cache window.",
+                     params.n_swa_cache),
+        [](common_params & params, int value) {
+            params.n_swa_cache = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),

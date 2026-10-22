@@ -993,9 +993,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
-    int32_t n_embd_dec = 0;  // draft hidden size
-    int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
-    int32_t n_embd_tgt = 0;  // target model hidden size
+    int32_t n_embd_dec  = 0;  // draft hidden size
+    int32_t n_embd_enc  = 0;  // target_layer_ids_n * target_hidden_size
+    int32_t n_embd_tgt  = 0;  // target model hidden size
+    int32_t n_layer_tgt = 0;  // target model layer count
 
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
@@ -1042,6 +1043,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_embd_tgt    = llama_model_n_embd(model_tgt);
         n_embd_dec    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
+        n_layer_tgt   = llama_model_n_layer(model_tgt);
 
         // read the trained block size from the dflash.block_size metadata key
         block_size = 16;
@@ -1056,6 +1058,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
                 causal_attn = std::strcmp(buf, "true") == 0;
             }
+            // DFlash block diffusion is non-causal; laguna drafters must not
+            // override this (leaving it causal produces wrong or NaN outputs).
         }
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
@@ -1129,9 +1133,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        // turn on extraction of the target layers' input embeddings
+        // turn on extraction of the target layers' hidden states.
+        // target_layer_ids[k] == n_layer_tgt is routed through nextn (the
+        // post-loop residual), matching the laguna branch.
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            if (target_layer_ids[k] < n_layer_tgt) {
+                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            } else if (target_layer_ids[k] == n_layer_tgt) {
+                llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+            } else {
+                GGML_ABORT("DFlash: target layer id %d exceeds target n_layer %d", target_layer_ids[k], n_layer_tgt);
+            }
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
@@ -1224,10 +1236,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
                 // gather target features per extract layer; the fused decode encodes and
-                // injects them into the K/V cache at the target positions
+                // injects them into the K/V cache at the target positions.
+                // index == n_layer_tgt is the post-loop residual, read via nextn.
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    const float * layer = target_layer_ids[k] < n_layer_tgt
+                        ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
+                        : llama_get_embeddings_nextn(ctx_tgt);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
@@ -1235,6 +1250,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    }
+                }
+
+                // Defensive: sanitize non-finite values (NaN/Inf) in the
+                // extracted target features before they enter the draft
+                // encoder. On V100 + Q4 + FP8 KV these can appear.
+                for (size_t i = 0; i < features_buf.size(); ++i) {
+                    if (!std::isfinite(features_buf[i])) {
+                        features_buf[i] = 0.0f;
                     }
                 }
 

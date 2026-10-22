@@ -193,6 +193,15 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
         const float beta_slow_l   = is_swa_il ? 0.0f : beta_slow;
         const int   n_ctx_orig_l  = is_swa_il ? hparams.n_ctx_train : n_ctx_orig;
 
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = inpL;
+            // TEMP: verify residual shape for extract_layer_inputs
+        fprintf(stderr, "[laguna] t_layer_inp[%d] ne=[%d,%d] nb=[%d,%d] n_embd=%d\n",
+                il, (int) inpL->ne[0], (int) inpL->ne[1], (int) inpL->nb[0], (int) inpL->nb[1], (int) hparams.n_embd);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
         ggml_tensor * inpSA = inpL;
 
         // Pre-norm
@@ -319,6 +328,15 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
         cb(cur, "l_out", il);
 
         inpL = cur;
+    }
+
+    if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
+        res->t_layer_inp[n_layer] = inpL;
+        // TEMP: verify residual shape for extract_layer_inputs
+        fprintf(stderr, "[laguna] t_layer_inp[%d] ne=[%d,%d] nb=[%d,%d] n_embd=%d\n",
+                (int) n_layer, (int) inpL->ne[0], (int) inpL->ne[1], (int) inpL->nb[0], (int) inpL->nb[1], (int) hparams.n_embd);
+        cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
+        ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
 
     cur = inpL;

@@ -176,6 +176,8 @@ struct server_task {
 
     server_task_type type;
 
+    bool pin_donor = false; // task is marked for donor slot assignment (fire-once [[pin]])
+
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
     struct slot_action {
         int id_slot;
