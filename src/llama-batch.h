@@ -87,7 +87,8 @@ struct llama_ubatch {
 
 struct llama_hparams;
 
-// DFlash batches carry the fused target features at the encoder input width (n_embd_inp_enc size).
+// DFlash batches carry either pre-projected features (n_embd size) or raw
+// extracted features (n_embd_inp_enc size); both are accepted by set_token_embd.
 // Other batches carry token embeddings (n_embd_inp size).
 size_t llama_batch_ext_select_n_embd_inp(llama_context_type ctx_type, llm_arch arch, const llama_hparams & hparams);
 

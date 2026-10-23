@@ -238,6 +238,78 @@ Build with the V100 cmake line above. `CMAKE_CUDA_ARCHITECTURES=70` is mandatory
 9. `src/llama-kv-cache-iswa.cpp`, `common/arg.cpp`, context params — `--swa-cache`.
 10. No new CUDA files. If a kernel is unavoidable, guard it with `sm_70` and test the build.
 
+## Part F — draft KV clear condition
+
+### Problem
+
+With `--cache-prompt` and LCP reuse, a slot release is often just a turn
+boundary inside the same conversation. The draft KV (in `ctx_dft`) was being
+wiped on every release because `prompt_clear()` called `mem.seq_rm(id, -1, -1)`,
+which clears the sequence from **both** the target (`ctx_tgt`) and the draft
+(`ctx_dft`) KV caches. On the next turn, LCP kept the target KV (f_sim=1.0,
+f_keep=1.0) but the draft KV was gone, so draft acceptance dropped to 0%.
+
+### Fix
+
+`prompt_clear()` now clears **only** the target KV via
+`llama_memory_seq_rm(llama_get_memory(ctx_tgt), id, -1, -1)`. The draft KV is
+cleared separately by the new `clear_draft_kv()` method:
+
+```cpp
+void clear_draft_kv() {
+    if (ctx_dft) {
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), id, -1, -1);
+    }
+}
+```
+
+### Exact condition that gates the draft clear
+
+> The draft KV is cleared if and only if the **target** KV for that slot is
+> also being discarded — i.e., whenever `prompt_clear()` is called.
+
+`clear_draft_kv()` is called immediately after every `prompt_clear()` call site.
+There are 10 call sites, all in `tools/server/server-context.cpp`:
+
+| # | Location | Why target KV is discarded |
+|---|----------|---------------------------|
+| 1 | `release()` — child / stateless / audio_stream | context not reused |
+| 2 | `release()` — SERVER_TASK_TYPE_TTS | mtmd always re-evals |
+| 3 | `get_available_slot()` — cache load failure | target replaced with new tokens |
+| 4 | `try_clear_idle_slots()` — purge | idle slot purged under `kv_unified` |
+| 5 | `launch_slot()` — SERVER_TASK_TYPE_TTS | mtmd always re-evals |
+| 6 | `launch_slot()` — SERVER_TASK_TYPE_TRANSCRIBE_RT | audio rows, no KV reuse |
+| 7 | `update_slots()` — TAG_IDLE_SLOT_CLEAR | idle slot cleared under `kv_unified` |
+| 8 | slot load error | restore failed, target reset |
+| 9 | slot erase | explicit erase |
+| 10 | decode error | eval failed, target reset |
+
+### LCP hit path (draft KV preserved)
+
+`get_available_slot()` selects a slot by LCP similarity **without** calling
+`prompt_clear()`. The slot's target KV is kept (cells past the fork belong to
+the worker only). Because `clear_draft_kv()` is never called on this path, the
+draft KV stays aligned with the kept target KV and draft acceptance survives
+across turns.
+
+When `f_keep < 0.5f` on an LCP hit, `update_cache` is set and the prompt is
+saved to / loaded from the prompt cache. If the cache load **succeeds**,
+`prompt_clear()` is not called and the draft is preserved. If the cache load
+**fails** (cache miss), `prompt_clear()` + `clear_draft_kv()` run — the target
+KV is being replaced, so the draft is correctly discarded too.
+
+### DFlash host-side state
+
+`spec_ckpt.data_dft` is a host-side snapshot of the draft state, used for
+speculative rollback. It is cleared by `slot.reset()` on every release (via
+`spec_ckpt.clear()`). This is safe: on the next task the checkpoint is
+re-populated from the live KV when `use_ckpt_dft` is true. No additional
+clearing is needed because `spec_ckpt` is not the KV cache itself.
+
+`features_buf`, `lilicorr_embd`, and per-seq samplers in
+`common_speculative_impl_draft_dflash` are transient — resized or reset on
+each `process()` / `draft()` call. No changes were needed.
+
 ## Out of scope
 
 - Publishing the fork.

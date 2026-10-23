@@ -1137,9 +1137,9 @@ void llama_batch_free(struct llama_batch batch) {
 
 size_t llama_batch_ext_select_n_embd_inp(llama_context_type ctx_type, llm_arch arch, const llama_hparams & hparams) {
     GGML_UNUSED(ctx_type);
-    if (arch == LLM_ARCH_DFLASH) {
-        return hparams.n_embd_inp_enc();
-    }
+    GGML_UNUSED(arch);
+    // DFlash decodes accept both n_embd (pre-projected) and n_embd_inp_enc (raw features).
+    // Returning n_embd_inp() here lets set_token_embd accept both widths.
     return hparams.n_embd_inp();
 }
 

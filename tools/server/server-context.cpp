@@ -376,10 +376,29 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        mem.seq_rm(id, -1, -1);
+        // clear only the target KV; the draft KV is cleared separately by
+        // clear_draft_kv(), which is called on the same path so that the draft
+        // survives across turn boundaries (LCP reuse) when the target KV is kept
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), id, -1, -1);
 
         prompt.clear();
     }
+
+    // clear the draft sequence only. Called when the target KV is also being
+    // discarded (prompt_clear / release / cache miss / idle purge), so the
+    // draft stays aligned with the target and is NOT wiped on a turn boundary
+    // where the target KV is retained via LCP reuse.
+     void clear_draft_kv() {
+         if (ctx_dft) {
+             const size_t size_before = llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+             llama_memory_seq_rm(llama_get_memory(ctx_dft), id, -1, -1);
+             const size_t size_after = ctx_dft
+                 ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+             // TEMP LOG: report draft seq_rm execution and resulting draft length
+             SLT_TRC(*this, "clear_draft_kv: seq_rm ran, size_before=%zu, size_after=%zu\n",
+                     size_before, size_after);
+         }
+     }
 
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
@@ -653,11 +672,13 @@ struct server_slot {
             // nor of the stateless slots - no task ever reuses it
             if (task->is_child() || task->is_stateless() || audio_stream) {
                 prompt_clear();
+                clear_draft_kv();
             }
 
             // mtmd_helper always re-eval the whole prompt
             if (task->type == SERVER_TASK_TYPE_TTS) {
                 prompt_clear();
+                clear_draft_kv();
             }
 
             callback_on_reset(*this);
@@ -1842,6 +1863,28 @@ private:
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             f_sim_best, slot_prompt_similarity, f_keep);
+
+                    // TEMP LOG: report LCP hit details and draft KV state before any clear
+                    const llama_pos dft_pos_max = ctx_dft
+                        ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), ret->id) : -1;
+                    const size_t dft_seq_size = ctx_dft
+                        ? llama_state_seq_get_size_ext(ctx_dft, ret->id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+                    SLT_INF(*ret, "LCP hit: is_lcp=true, f_keep=%.3f, f_sim=%.3f, "
+                            "draft_pos_max=%d, draft_seq_size=%zu\n",
+                            f_keep, f_sim_best, (int) dft_pos_max, dft_seq_size);
+
+                    // EXP FIX: on LCP reuse where any target prefix is kept (f_keep > 0),
+                    // clear the draft KV so stale entries from the previous turn do not
+                    // corrupt the new draft. The target KV is retained intact (the LCP
+                    // prefix is valid). Without this, stale draft KV causes acceptance
+                    // to collapse on the second follow-up.
+                    if (ctx_dft && f_keep > 0.0f) {
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), ret->id, -1, -1);
+                        const size_t dft_seq_size_after =
+                            llama_state_seq_get_size_ext(ctx_dft, ret->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                        SLT_INF(*ret, "LCP hit: cleared draft KV (f_keep=%.3f), "
+                                "draft_seq_size_after=%zu\n", f_keep, dft_seq_size_after);
+                    }
                 }
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
@@ -1879,6 +1922,7 @@ private:
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
+                    ret->clear_draft_kv();
                 }
 
                 prompt_cache->update();
@@ -1915,6 +1959,7 @@ private:
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
                 slot.prompt_clear();
+                slot.clear_draft_kv();
 
                 res = true;
 
@@ -2019,6 +2064,7 @@ private:
             }
             // mtmd_helper always re-eval the whole prompt
             slot.prompt_clear();
+            slot.clear_draft_kv();
             task.tts_inp.data.seq_id = slot.id;
             if (slot.tts.ctx.set_input(task.tts_inp.get()) != 0) {
                 send_error(task, "failed to process TTS prompt", ERROR_TYPE_SERVER);
@@ -2088,6 +2134,7 @@ private:
                 return false;
             }
             slot.prompt_clear();
+            slot.clear_draft_kv();
             slot.init_sampler();
             slot.sampled = LLAMA_TOKEN_NULL;
             slot.i_batch = -1;
@@ -3040,6 +3087,7 @@ private:
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
+                                    slot.clear_draft_kv();
                                 }
                             }
                         }
@@ -3262,6 +3310,7 @@ private:
                         slot->prompt.tokens = std::move(restored);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
+                        slot->clear_draft_kv();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
@@ -3302,6 +3351,7 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear();
+                    slot->clear_draft_kv();
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -4641,6 +4691,7 @@ private:
                             // note: it's complicated to keep track of how much of the current batch has been
                             //       processed before the error occurred, so we simply clear the entire context
                             slot.prompt_clear();
+                            slot.clear_draft_kv();
                         }
                     }
 
@@ -5249,6 +5300,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // read and clear pending pin-donor flag (set by [[pin]] scanner in post_chat_completions)
         const bool pin_donor = ctx_server.pending_pin_donor;
         ctx_server.pending_pin_donor = false;
+        if (pin_donor) {
+            SRV_INF("%s", "pin_donor flag set for this task, marking task for donor slot assignment\n");
+        }
 
         const auto & prompt = data.at("prompt");
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
@@ -5926,8 +5980,9 @@ void server_routes::init_routes() {
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
 
-        // fire-once [[pin]]: scan system messages only while armed, strip before template
+        // fire-once [[pin]]: scan system and user messages while armed, strip before template
         if (ctx_server.pin_armed && body.contains("messages") && body.at("messages").is_array()) {
+            SRV_DBG("%s", "pin armed, scanning messages for [[pin]]\n");
             auto & messages = body.at("messages");
             auto strip_pin = [](std::string & s) -> bool {
                 size_t pos = s.rfind("[[pin]]");
@@ -5940,7 +5995,11 @@ void server_routes::init_routes() {
             };
             for (size_t i = 0; i < messages.size(); i++) {
                 auto & msg = messages[i];
-                if (msg.value("role", std::string()) != "system") continue;
+                // TEMP: also scan user messages so apps can fire [[pin]] from the user prompt
+                {
+                    const auto & role = msg.value("role", std::string());
+                    if (role != "system" && role != "user") continue;
+                }
                 if (!msg.contains("content")) continue;
                 auto & content = msg["content"];
                 bool found = false;
@@ -5967,8 +6026,12 @@ void server_routes::init_routes() {
                     if (drop) {
                         messages.erase(i);
                     }
+                    SRV_INF("[[pin]] found in %s message %zu, stripping marker (msg %s)\n",
+                            msg.value("role", std::string()).c_str(), i,
+                            drop ? "dropped (empty after strip)" : "kept");
                     ctx_server.pin_armed = false;
                     ctx_server.pending_pin_donor = true;
+                    SRV_INF("%s", "pin donor scheduled: pin_armed=false, pending_pin_donor=true\n");
                     break; // fire-once: stop scanning after first hit
                 }
             }

@@ -1846,7 +1846,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
-    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
+    if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp &&
+            batch_inp.n_embd != batch_inp.n_embd_inp_enc) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
         return -1;

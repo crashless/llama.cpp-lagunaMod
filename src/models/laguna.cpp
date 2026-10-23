@@ -195,9 +195,6 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
 
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = inpL;
-            // TEMP: verify residual shape for extract_layer_inputs
-        fprintf(stderr, "[laguna] t_layer_inp[%d] ne=[%d,%d] nb=[%d,%d] n_embd=%d\n",
-                il, (int) inpL->ne[0], (int) inpL->ne[1], (int) inpL->nb[0], (int) inpL->nb[1], (int) hparams.n_embd);
             cb(res->t_layer_inp[il], "layer_inp", il);
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
@@ -271,7 +268,7 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "attn_o_proj", il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -332,17 +329,19 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
         res->t_layer_inp[n_layer] = inpL;
-        // TEMP: verify residual shape for extract_layer_inputs
-        fprintf(stderr, "[laguna] t_layer_inp[%d] ne=[%d,%d] nb=[%d,%d] n_embd=%d\n",
-                (int) n_layer, (int) inpL->ne[0], (int) inpL->ne[1], (int) inpL->nb[0], (int) inpL->nb[1], (int) hparams.n_embd);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
 
     cur = inpL;
+    res->t_h_nextn = cur;
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);

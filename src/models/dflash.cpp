@@ -886,20 +886,54 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // KV cache injection
     ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+        ggml_tensor * inp_g = nullptr;
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
+        // Determine the batch's embedding width. llana_ubatch does not carry
+        // n_embd directly, so derive it from the owned data vector when available.
+        const int64_t n_embd_ubatch = ubatch.data && ubatch.n_tokens > 0
+            ? (int64_t)(ubatch.data->embd.size() / ubatch.n_tokens)
+            : n_embd_inp;
 
-        ggml_tensor * inp_target = inp->embd;
-        cb(inp_target, "inp_target_features", -1);
+        if (n_embd_ubatch == n_embd) {
+            // Pre-projected features (n_embd_dec width): reuse directly for K/V injection
+            auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
-        res->add_input(std::move(inp));
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(inp->embd);
 
-        // fuse the target features through the encoder
-        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
-        inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
-        cb(inp_g, "inp_g_embeddings", -1);
+            inp_g = inp->embd;
+            cb(inp_g, "inp_g_embeddings", -1);
+
+            res->add_input(std::move(inp));
+        } else {
+            // Raw target features (n_embd_enc width): project through the encoder
+            auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+            ggml_set_input(inp->embd);
+
+            ggml_tensor * inp_target = inp->embd;
+            cb(inp_target, "inp_target_features", -1);
+
+            res->add_input(std::move(inp));
+
+            // Laguna: RMS-norm each captured feature before concat + fc
+            if (model_df.aux_norm != nullptr) {
+                const int64_t n_aux  = model_df.aux_norm->ne[1];
+                const int64_t n_feat = hparams.n_embd_inp_enc() / n_aux;
+
+                inp_target = ggml_reshape_3d(ctx0, inp_target, n_feat, n_aux, n_tokens);
+                inp_target = ggml_rms_norm(ctx0, inp_target, norm_rms_eps);
+                inp_target = ggml_mul(ctx0, inp_target, model_df.aux_norm);
+                inp_target = ggml_reshape_2d(ctx0, inp_target, n_feat * n_aux, n_tokens);
+                cb(inp_target, "dec_aux_norm", -1);
+            }
+
+            // fuse the target features through the encoder
+            inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+            inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
+            cb(inp_g, "inp_g_embeddings", -1);
+        }
 
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];

@@ -985,6 +985,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     common_batch batch;        // noise tokens
     common_batch batch_inject; // target features for KV cache injection
+    common_batch batch_enc;    // encoder input for the two-call projection pattern
 
     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
 
@@ -1057,6 +1058,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
                 causal_attn = std::strcmp(buf, "true") == 0;
+            } else if (llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
+                // PLAN.md: if dflash.attention.causal is not in the GGUF, fall back
+                // to decoder_arch == "laguna" (laguna noise blocks are causal).
+                causal_attn = std::strcmp(buf, "laguna") == 0;
             }
             // DFlash block diffusion is non-causal; laguna drafters must not
             // override this (leaving it causal produces wrong or NaN outputs).
@@ -1104,6 +1109,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         batch        = common_batch(ctx_dft);
         batch_inject = common_batch(ctx_dft);
+        batch_enc    = common_batch(ctx_dft);
 
         // embd batches on an M-RoPE draft carry 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
@@ -1165,23 +1171,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         backend_chains.clear();
     }
 
-    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return;
-        }
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+             return;
+         }
 
-        const int32_t N = (int32_t) prompt.size();
-        if (N <= 0) {
-            return;
-        }
+         const int32_t N = (int32_t) prompt.size();
+         if (N <= 0) {
+             return;
+         }
 
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
-        if (pos_max < N - 1) {
-            LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
-                    "Drafts may degrade.\n",
-                    __func__, (int) pos_max, N - 1);
-        }
-    }
+         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
+
+         // TEMP LOG: report draft KV state at speculative begin
+         const size_t dft_seq_size = llama_state_seq_get_size_ext(params.ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         SPC_INF("[dflash begin] seq_id=%d, N=%d, dft_pos_max=%d, dft_seq_size=%zu\n",
+                 (int) seq_id, N, (int) pos_max, dft_seq_size);
+
+         if (pos_max < N - 1) {
+             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
+                     "Drafts may degrade.\n",
+                     __func__, (int) pos_max, N - 1);
+         }
+     }
 
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
@@ -1239,6 +1251,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // injects them into the K/V cache at the target positions.
                 // index == n_layer_tgt is the post-loop residual, read via nextn.
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
+                // TEMP LOG: check layer-input / nextn embeddings are non-null before use
+                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    const float * layer_check = target_layer_ids[k] < n_layer_tgt
+                        ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
+                        : llama_get_embeddings_nextn(ctx_tgt);
+                    SPC_TRC("[dflash process] seq_id=%d, k=%u/%u, target_layer=%u, emb_non_null=%d\n",
+                            (int) seq_id, (uint32_t) k, target_layer_ids_n - 1,
+                            target_layer_ids[k], layer_check != nullptr ? 1 : 0);
+                }
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = target_layer_ids[k] < n_layer_tgt
                         ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
@@ -1253,24 +1274,65 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
+                // TEMP LOG: quick finite-check on the fused feature buffer before sanitize
+                int n_nonfinite = 0;
+                for (size_t i = 0; i < features_buf.size(); ++i) {
+                    if (!std::isfinite(features_buf[i])) {
+                        n_nonfinite++;
+                    }
+                }
+                SPC_TRC("[dflash process] seq_id=%d, n_chunk=%d, features_buf_size=%zu, nonfinite=%d\n",
+                        (int) seq_id, (int) n_chunk, features_buf.size(), n_nonfinite);
+
                 // Defensive: sanitize non-finite values (NaN/Inf) in the
                 // extracted target features before they enter the draft
                 // encoder. On V100 + Q4 + FP8 KV these can appear.
                 for (size_t i = 0; i < features_buf.size(); ++i) {
-                    if (!std::isfinite(features_buf[i])) {
-                        features_buf[i] = 0.0f;
+                    float v = features_buf[i];
+                    if (!std::isfinite(v)) {
+                        v = v != v ? 0.0f : (v > 0.0f ? 65504.0f : -65504.0f);
                     }
+                    features_buf[i] = v;
                 }
 
+                // Diagnostic: print the feature buffer dimensions before use
+                fprintf(stderr, "dflash process: features_buf n_chunk=%d n_embd_enc=%d n_embd_dec=%d\n",
+                        (int) n_chunk, (int) n_embd_enc, (int) n_embd_dec);
+
+                // Encoder call: project raw target features (n_embd_enc) to draft
+                // features (n_embd_dec) via the encoder graph
+                batch_enc.clear();
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
+                    const llama_pos pos_arr[4] = { p, p, p, 0 };
+                    batch_enc.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                }
+                const int32_t rc_enc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_ENCODE, batch_enc.get());
+                if (rc_enc != 0) {
+                    LOG_ERR("%s: llama_process(ctx_dft) encoder failed rc=%d (n_tokens=%d, offset=%d)\n",
+                            __func__, rc_enc, (int) n_chunk, (int) offset);
+                    return false;
+                }
+
+                // Bulk copy the projected features into features_buf for the decoder
+                const float * projected = llama_get_embeddings_nextn(ctx_dft);
+                if (!projected) {
+                    LOG_ERR("%s: llama_get_embeddings_nextn(ctx_dft) returned null after encoder\n", __func__);
+                    return false;
+                }
+                features_buf.resize((size_t) n_chunk * (size_t) n_embd_dec);
+                std::memcpy(features_buf.data(), projected, (size_t) n_chunk * (size_t) n_embd_dec * sizeof(float));
+
+                // Decoder call: inject the pre-projected K/V into the cache
                 batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
-                    batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_dec, 1, (size_t) n_embd_dec }, pos_arr, seq_id, false);
                 }
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
                 if (rc != 0) {
-                    LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                    LOG_ERR("%s: llama_process(ctx_dft) decoder failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
