@@ -1181,14 +1181,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
              return;
          }
 
-         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
 
-         // TEMP LOG: report draft KV state at speculative begin
-         const size_t dft_seq_size = llama_state_seq_get_size_ext(params.ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
-         SPC_INF("[dflash begin] seq_id=%d, N=%d, dft_pos_max=%d, dft_seq_size=%zu\n",
-                 (int) seq_id, N, (int) pos_max, dft_seq_size);
-
-         if (pos_max < N - 1) {
+        if (pos_max < N - 1) {
              LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
                      "Drafts may degrade.\n",
                      __func__, (int) pos_max, N - 1);
@@ -1251,15 +1246,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // injects them into the K/V cache at the target positions.
                 // index == n_layer_tgt is the post-loop residual, read via nextn.
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
-                // TEMP LOG: check layer-input / nextn embeddings are non-null before use
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer_check = target_layer_ids[k] < n_layer_tgt
-                        ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
-                        : llama_get_embeddings_nextn(ctx_tgt);
-                    SPC_TRC("[dflash process] seq_id=%d, k=%u/%u, target_layer=%u, emb_non_null=%d\n",
-                            (int) seq_id, (uint32_t) k, target_layer_ids_n - 1,
-                            target_layer_ids[k], layer_check != nullptr ? 1 : 0);
-                }
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = target_layer_ids[k] < n_layer_tgt
                         ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
@@ -1274,16 +1260,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
-                // TEMP LOG: quick finite-check on the fused feature buffer before sanitize
-                int n_nonfinite = 0;
-                for (size_t i = 0; i < features_buf.size(); ++i) {
-                    if (!std::isfinite(features_buf[i])) {
-                        n_nonfinite++;
-                    }
-                }
-                SPC_TRC("[dflash process] seq_id=%d, n_chunk=%d, features_buf_size=%zu, nonfinite=%d\n",
-                        (int) seq_id, (int) n_chunk, features_buf.size(), n_nonfinite);
-
                 // Defensive: sanitize non-finite values (NaN/Inf) in the
                 // extracted target features before they enter the draft
                 // encoder. On V100 + Q4 + FP8 KV these can appear.
@@ -1294,10 +1270,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     features_buf[i] = v;
                 }
-
-                // Diagnostic: print the feature buffer dimensions before use
-                fprintf(stderr, "dflash process: features_buf n_chunk=%d n_embd_enc=%d n_embd_dec=%d\n",
-                        (int) n_chunk, (int) n_embd_enc, (int) n_embd_dec);
 
                 // Encoder call: project raw target features (n_embd_enc) to draft
                 // features (n_embd_dec) via the encoder graph

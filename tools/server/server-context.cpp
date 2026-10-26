@@ -336,7 +336,11 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
-    server_prompt prompt;
+     server_prompt prompt;
+
+    // true after a successful prompt_cache load; used to guard against
+    // do_reset discarding restored KV state in the checkpoint path
+    bool prompt_cache_restored = false;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -370,6 +374,7 @@ struct server_slot {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
 
+        prompt_cache_restored = res;
         return res;
     }
 
@@ -382,6 +387,7 @@ struct server_slot {
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), id, -1, -1);
 
         prompt.clear();
+        prompt_cache_restored = false;
     }
 
     // clear the draft sequence only. Called when the target KV is also being
@@ -1805,6 +1811,7 @@ private:
             if (ret) {
                 if (ret->id == donor_slot) {
                     // donor slot is never selected directly
+                    SRV_INF("pin path: requested slot %d is the donor slot, rejecting\n", task.id_slot);
                     ret = nullptr;
                 } else if (ret->is_processing()) {
                     // a busy slot is returned untouched, the caller defers the task
@@ -1826,6 +1833,7 @@ private:
 
                 // never select the donor slot
                 if (slot.id == donor_slot) {
+                    SLT_TRC(slot, "%s", " - skipping, is donor slot\n");
                     continue;
                 }
 
@@ -1948,7 +1956,7 @@ private:
 
         for (auto & slot : slots) {
             if (slot.id == donor_slot) {
-                continue;
+                continue; // never clear the donor slot
             }
 
             if (slot.is_processing()) {
@@ -2662,7 +2670,10 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot && slot.id != donor_slot) {
+            if (slot.id == donor_slot) {
+                continue; // never select the donor slot
+            }
+            if (!slot.is_processing() && slot.id != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
         }
@@ -3074,7 +3085,7 @@ private:
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
                             if (slot.id == donor_slot) {
-                                continue;
+                                continue; // never cache the donor slot
                             }
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -3579,6 +3590,8 @@ private:
             }
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+            SRV_INF("regular batch: embeddings=%d (need_embd=%d, slot=%d)\n",
+                    (int) slot_batched->need_embd(), (int) slot_batched->need_embd(), slot_batched->id);
         }
 
         int32_t off_next = 0;
@@ -3695,6 +3708,11 @@ private:
                 }
             }
         });
+
+        // TTS sets embeddings=true for the whole context; reset to false so
+        // the flag does not leak into regular generation batches.
+        llama_set_embeddings(ctx_tgt, false);
+        SRV_INF("%s", "process_tts_slots: embeddings flag reset to false\n");
     }
 
     void pre_decode() {
@@ -3737,9 +3755,15 @@ private:
 
                 // guard: protect donor prefix cells from being shifted
                 if (donor_slot >= 0 && slot.prompt.n_tokens() > 0) {
-                    const size_t n_donor_prefix = slot.prompt.tokens.get_common_prefix(donor_tokens);
-                    if (n_donor_prefix > 0 && n_keep < (int) n_donor_prefix) {
-                        n_keep = (int) n_donor_prefix;
+                    if (donor_tokens.empty()) {
+                        SRV_ERR("pin path: donor_slot=%d but donor_tokens empty, skipping donor prefix guard in context shift\n", donor_slot);
+                    } else {
+                        const size_t n_donor_prefix = slot.prompt.tokens.get_common_prefix(donor_tokens);
+                        SRV_INF("pin path: context shift donor guard, donor_slot=%d, n_donor_prefix=%zu, n_keep=%d\n",
+                                donor_slot, n_donor_prefix, n_keep);
+                        if (n_donor_prefix > 0 && n_keep < (int) n_donor_prefix) {
+                            n_keep = (int) n_donor_prefix;
+                        }
                     }
                 }
 
@@ -4130,20 +4154,50 @@ private:
                                 n_past = 0;
                             }
 
-                            // donor prefix reuse (kv_unified only, fresh slot)
-                            if (n_past == 0 && params_base.kv_unified && donor_slot >= 0) {
-                                const size_t lcp_len = donor_tokens.get_common_prefix(input_tokens);
-                                if (lcp_len >= donor_tokens.size() - 1 && lcp_len > 0) {
-                                    const size_t n_copy = lcp_len - 1; // leave 1 token for the worker
-                                    if (n_copy > 0) {
-                                        slot.mem.seq_cp(donor_slot, slot.id, 0, (llama_pos) n_copy);
-                                        for (size_t i = 0; i < n_copy; i++) {
-                                            slot.prompt.tokens.push_back(input_tokens[i]);
+                            // donor prefix reuse (kv_unified only)
+                            // when n_past > 0, the prompt cache already restored a prefix;
+                            // donor reuse is only applied if it provides a larger LCP
+                            if (params_base.kv_unified && donor_slot >= 0) {
+                                if (ctx_tgt == nullptr) {
+                                    SRV_ERR("pin path: ctx_tgt is null but donor_slot=%d >= 0, skipping donor reuse\n", donor_slot);
+                                } else if (donor_tokens.empty()) {
+                                    SRV_ERR("pin path: donor_tokens empty but donor_slot=%d >= 0, skipping donor reuse\n", donor_slot);
+                                } else if (slot.mem.ctx_tgt == nullptr) {
+                                    SRV_ERR("pin path: slot.mem.ctx_tgt null for slot.id=%d, donor_slot=%d, skipping seq_cp\n", slot.id, donor_slot);
+                                } else {
+                                     SRV_INF("pin path: donor reuse entry: donor_slot=%d, worker slot.id=%d, donor_tokens.size=%zu, input_tokens.size=%zu\n",
+                                             donor_slot, slot.id, donor_tokens.size(), input_tokens.size());
+                                     // require at least 2 matching tokens so that lcp_len - 1 >= 1 KV copy
+                                     const size_t lcp_threshold = 2;
+                                     const size_t lcp_len = donor_tokens.get_common_prefix(input_tokens);
+                                     SRV_INF("pin path: lcp_len=%zu (donor_tokens.size=%zu, threshold=%zu), current n_past=%d\n",
+                                            lcp_len, donor_tokens.size(), lcp_threshold, n_past);
+                                    if (lcp_len >= lcp_threshold && lcp_len > 0 && lcp_len > (size_t)n_past) {
+                                        // NOTE: when n_past > 0, the prompt cache already restored
+                                        // KV state and prompt tokens for a different prefix.
+                                        // seq_cp will overlay the donor's KV at positions [0, n_copy),
+                                        // but stale KV at positions beyond n_copy from the prompt
+                                        // cache restore may remain.
+                                        if (n_past > 0) {
+                                            SLT_INF(slot, "donor reuse: overriding prompt cache (n_past=%d -> lcp=%zu)\n", n_past, lcp_len);
+                                            slot.prompt.clear();
                                         }
+                                        const size_t n_copy = lcp_len - 1; // leave 1 token for the worker
+                                        if (n_copy > 0) {
+                                            SRV_INF("pin path: about to seq_cp donor_slot=%d -> worker_slot=%d, n_copy=%zu, ctx_tgt=%p\n",
+                                                    donor_slot, slot.id, n_copy, (void *) ctx_tgt);
+                                            slot.mem.seq_cp(donor_slot, slot.id, 0, (llama_pos) n_copy);
+                                            SRV_INF("pin path: seq_cp completed, copying %zu tokens to prompt\n", n_copy);
+                                            for (size_t i = 0; i < n_copy; i++) {
+                                                slot.prompt.tokens.push_back(input_tokens[i]);
+                                            }
+                                        }
+                                        n_past = (int) n_copy;
+                                        SLT_INF(slot, "donor reuse: donor slot=%d, lcp=%zu, worker slot=%d\n",
+                                                donor_slot, lcp_len, slot.id);
+                                    } else if (n_past > 0 && (size_t)n_past >= lcp_len) {
+                                        SLT_INF(slot, "donor reuse: skipped, n_past=%d >= lcp=%zu\n", n_past, lcp_len);
                                     }
-                                    n_past = (int) n_copy;
-                                    SLT_INF(slot, "donor reuse: donor slot=%d, lcp=%zu, worker slot=%d\n",
-                                            donor_slot, lcp_len, slot.id);
                                 }
                             }
 
@@ -4253,10 +4307,19 @@ private:
                                     }
 
                                     if (do_reset) {
-                                        SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        pos_next = 0;
-                                        n_past = 0;
+                                        if (slot.prompt_cache_restored) {
+                                            // Prompt cache restored KV at known-good positions;
+                                            // do not discard — skip the reset and keep n_past.
+                                            SLT_INF(slot, "prompt_cache_restored=true, skipping do_reset "
+                                                     "(n_past=%d, pos_min=%d, pos_min_thold=%d)\n",
+                                                     n_past, (int) pos_min, (int) pos_min_thold);
+                                            do_reset = false;
+                                        } else {
+                                            SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
+                                                    "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                            pos_next = 0;
+                                            n_past = 0;
+                                        }
                                     }
                                 }
                             }
@@ -4653,6 +4716,9 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            // ensure embeddings is false right before evaluation: the worker thread
+            // may run concurrently during yield and could modify cparams.embeddings
+            llama_set_embeddings(ctx_tgt, false);
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -4794,13 +4860,25 @@ private:
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
                 // pin_donor: store prefix in this slot as the donor, skip generation
-                if (slot.task->pin_donor) {
+                if (slot.task && slot.task->pin_donor) {
+                    SRV_INF("pin path: donor slot claiming slot.id=%d, pin_donor=true, checking preconditions\n", slot.id);
+                    if (slot.task->tokens.empty()) {
+                        SRV_ERR("pin path: WARNING slot.id=%d pin_donor=true but donor tokens are empty\n", slot.id);
+                    }
+                    SRV_INF("pin path: about to assign donor_slot=%d (was %d), cloning %zu tokens\n",
+                            slot.id, donor_slot, slot.task->tokens.size());
                     donor_slot = slot.id;
                     donor_tokens = slot.task->tokens.clone();
+                    SRV_INF("pin path: donor_slot=%d assigned, donor_tokens.size=%zu (was %zu before clone)\n",
+                            donor_slot, donor_tokens.size(), (size_t) slot.task->tokens.size());
                     SLT_INF(slot, "donor slot=%d, n_tokens=%zu\n", slot.id, donor_tokens.size());
                     send_final_response(slot);
                     slot.release();
                     slot.i_batch = -1;
+                    SRV_INF("pin path: donor slot %d claimed and released, donor_slot now=%d\n", slot.id, donor_slot);
+                    return;
+                } else if (slot.task == nullptr) {
+                    SRV_ERR("pin path: slot.id=%d state=DONE_PROMPT but task is null, skipping\n", slot.id);
                     return;
                 }
 
@@ -5298,10 +5376,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         std::vector<server_task> tasks;
 
         // read and clear pending pin-donor flag (set by [[pin]] scanner in post_chat_completions)
+        SRV_INF("pin path: handle_completions_impl entry, pin_armed=%d, pending_pin_donor=%d\n",
+                (int) ctx_server.pin_armed, (int) ctx_server.pending_pin_donor);
         const bool pin_donor = ctx_server.pending_pin_donor;
         ctx_server.pending_pin_donor = false;
         if (pin_donor) {
-            SRV_INF("%s", "pin_donor flag set for this task, marking task for donor slot assignment\n");
+            SRV_INF("%s", "pin path: pending_pin_donor read and cleared, will mark tasks with pin_donor=true\n");
+        } else {
+            SRV_INF("%s", "pin path: pending_pin_donor was false, no pin donor marking\n");
         }
 
         const auto & prompt = data.at("prompt");
@@ -5346,6 +5428,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.apply_chat_session(chat_session);
 
             if (pin_donor) {
+                SRV_INF("pin path: setting task.pin_donor=true for task id=%d (input[%zu], n_tokens=%d)\n",
+                        task.id, i, task.n_tokens());
                 task.pin_donor = true;
             }
 
@@ -5368,6 +5452,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             tasks.push_back(std::move(task));
         }
 
+        SRV_INF("pin path: posting %zu tasks to queue (pin_donor_was=%d)\n",
+                tasks.size(), (int) pin_donor);
         rd.post_tasks(std::move(tasks), chat_session);
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
@@ -5981,16 +6067,26 @@ void server_routes::init_routes() {
         json body = json::parse(req.body);
 
         // fire-once [[pin]]: scan system and user messages while armed, strip before template
+        SRV_INF("pin scan: pin_armed=%d, has_messages=%d, body_size=%zu\n",
+                (int) ctx_server.pin_armed,
+                (int) body.contains("messages"),
+                body.size());
         if (ctx_server.pin_armed && body.contains("messages") && body.at("messages").is_array()) {
             SRV_DBG("%s", "pin armed, scanning messages for [[pin]]\n");
             auto & messages = body.at("messages");
-            auto strip_pin = [](std::string & s) -> bool {
+            SRV_INF("pin scan: scanning %zu messages\n", messages.size());
+            auto strip_pin = [](std::string & s, size_t idx, const char * ctx) -> bool {
                 size_t pos = s.rfind("[[pin]]");
                 if (pos == std::string::npos) return false;
+                SRV_INF("pin scan [%s]: found [[pin]] at pos=%zu (s.size=%zu), about to erase\n",
+                        ctx, pos, s.size());
                 s.erase(pos, 7); // "[[pin]]" is 7 chars
+                SRV_INF("pin scan [%s]: after erase, s.size=%zu\n", ctx, s.size());
                 if (pos > 0 && pos < s.size() && s[pos-1] == ' ' && s[pos] == ' ') {
+                    SRV_INF("pin scan [%s]: removing adjacent double-space at pos=%zu\n", ctx, pos);
                     s.erase(pos, 1); // remove adjacent space if double
                 }
+                (void) idx;
                 return true;
             };
             for (size_t i = 0; i < messages.size(); i++) {
@@ -6005,16 +6101,20 @@ void server_routes::init_routes() {
                 bool found = false;
                 if (content.is_string()) {
                     std::string s = content.get<std::string>();
-                    if (strip_pin(s)) {
+                    SRV_INF("pin scan: msg[%zu] role=%s content_is_string=%d len=%zu, scanning\n",
+                            i, msg.value("role", std::string()).c_str(), 1, s.size());
+                    if (strip_pin(s, i, "string")) {
                         content = s;
                         found = true;
                     }
                 } else if (content.is_array()) {
+                    SRV_INF("pin scan: msg[%zu] role=%s content_is_array=%d\n",
+                            i, msg.value("role", std::string()).c_str(), 1);
                     for (auto & part : content) {
                         if (part.value("type", std::string()) != "text") continue;
                         if (!part.contains("text") || !part.at("text").is_string()) continue;
                         std::string s = part.at("text").get<std::string>();
-                        if (strip_pin(s)) {
+                        if (strip_pin(s, i, "array-text")) {
                             part.at("text") = s;
                             found = true;
                             break;
@@ -6022,19 +6122,28 @@ void server_routes::init_routes() {
                     }
                 }
                 if (found) {
+                    // capture role before any erase to avoid dangling reference
+                    const std::string msg_role = msg.value("role", std::string());
                     bool drop = content.is_string() && content.get<std::string>().empty();
+                    SRV_INF("pin scan: msg[%zu] found=true, will_drop=%d, about to modify messages\n", i, (int) drop);
                     if (drop) {
+                        SRV_INF("pin scan: erasing message %zu from array (before erase size=%zu)\n", i, messages.size());
                         messages.erase(i);
+                        // msg and content references are now dangling; use msg_role instead
+                        SRV_INF("pin scan: after erase messages.size=%zu\n", messages.size());
                     }
                     SRV_INF("[[pin]] found in %s message %zu, stripping marker (msg %s)\n",
-                            msg.value("role", std::string()).c_str(), i,
+                            msg_role.c_str(), i,
                             drop ? "dropped (empty after strip)" : "kept");
+                    SRV_INF("%s", "pin scan: setting pin_armed=false, about to set pending_pin_donor=true\n");
                     ctx_server.pin_armed = false;
                     ctx_server.pending_pin_donor = true;
                     SRV_INF("%s", "pin donor scheduled: pin_armed=false, pending_pin_donor=true\n");
                     break; // fire-once: stop scanning after first hit
                 }
             }
+            SRV_INF("pin scan: completed scanning, pin_armed=%d, pending_pin_donor=%d\n",
+                    (int) ctx_server.pin_armed, (int) ctx_server.pending_pin_donor);
         }
 
         common_chat_session session;
