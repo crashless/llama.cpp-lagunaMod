@@ -157,10 +157,14 @@ public:
     llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed = false);
 
     // convert a llama_batch_ext to internal llama_batch and sanitize it
+    // caller_tag: short string identifying the code path (e.g. "decode", "encode")
+    // caller_id: address of the llama_context_params instance whose embeddings flag was read
     bool init(
             const llama_batch_ext & batch_inp,
             const llama_vocab & vocab,
-            bool output_all);
+            bool output_all,
+            const char * caller_tag = nullptr,
+            uintptr_t caller_id = 0);
 
     const llama_batch & get_batch() const;
 

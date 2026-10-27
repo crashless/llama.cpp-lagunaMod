@@ -888,7 +888,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     if (ubatch.embd) {
         ggml_tensor * inp_g = nullptr;
 
-        // Determine the batch's embedding width. llana_ubatch does not carry
+        // Determine the batch's embedding width. llama_ubatch does not carry
         // n_embd directly, so derive it from the owned data vector when available.
         const int64_t n_embd_ubatch = ubatch.data && ubatch.n_tokens > 0
             ? (int64_t)(ubatch.data->embd.size() / ubatch.n_tokens)

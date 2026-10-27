@@ -1514,6 +1514,9 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         if (llama_model_has_encoder(model)) {
             common_batch batch = common_batch_get_one(lctx, tmp);
+            for (int32_t i = 0; i < batch.size(); ++i) {
+                batch.set_output(i, true);
+            }
             llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get());
             llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
             if (decoder_start_token_id == LLAMA_TOKEN_NULL) {

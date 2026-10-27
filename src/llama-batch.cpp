@@ -28,7 +28,9 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed
 bool llama_batch_allocr::init(
         const llama_batch_ext & batch_inp,
         const llama_vocab & vocab,
-        bool output_all) {
+        bool output_all,
+        const char * caller_tag,
+        uintptr_t caller_id) {
     clear();
 
     this->vocab        = &vocab;
@@ -209,7 +211,33 @@ bool llama_batch_allocr::init(
                 if (!output[i]) { warn = true; break; }
             }
             if (warn) {
-                LLAMA_LOG_WARN("%s: embeddings required but some input tokens were not marked as outputs -> overriding\n", __func__);
+                // count total seq_ids and build a short preview (first few + last)
+                int32_t n_seq_total = 0;
+                for (int32_t i = 0; i < n_tok; ++i) {
+                    n_seq_total += n_seq_id[i];
+                }
+                std::string seq_preview;
+                int32_t shown = 0;
+                for (int32_t i = 0; i < n_tok && shown < 3; ++i) {
+                    for (int32_t s = 0; s < n_seq_id[i] && shown < 3; ++s, ++shown) {
+                        if (!seq_preview.empty()) seq_preview += ",";
+                        seq_preview += std::to_string(seq_id[i][s]);
+                    }
+                }
+                if (n_seq_total > 3) {
+                    seq_preview += "...";
+                }
+                LLAMA_LOG_WARN("%s: embeddings=%d required but some input tokens were not marked as outputs -> overriding (n_tok=%d, n_seq=%d, seq_ids=[%s])\n",
+                               __func__, (int) output_all, n_tok, n_seq_total, seq_preview.c_str());
+                // one-line diagnostic: which caller path triggered this, and whether
+                // this looks like a generation batch (decode) vs embedding batch (encode)
+                if (caller_tag && *caller_tag) {
+                    LLAMA_LOG_WARN("  caller=%s output_all=%d n_tok=%d cparams=%p (embeddings leaked into batch)\n",
+                                   caller_tag, (int) output_all, n_tok, (void *) caller_id);
+                } else {
+                    LLAMA_LOG_WARN("  caller=unknown output_all=%d n_tok=%d cparams=%p\n",
+                                   (int) output_all, n_tok, (void *) caller_id);
+                }
                 std::fill(output.begin(), output.end(), 1);
             }
         }

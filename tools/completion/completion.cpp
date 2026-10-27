@@ -526,6 +526,9 @@ int llama_completion(int argc, char ** argv) {
 
     if (llama_model_has_encoder(model)) {
         common_batch batch = common_batch_get_one(ctx, embd_inp);
+        for (int32_t i = 0; i < batch.size(); ++i) {
+            batch.set_output(i, true);
+        }
 
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get())) {
             LOG_ERR("%s : failed to eval\n", __func__);

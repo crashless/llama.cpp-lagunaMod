@@ -1061,7 +1061,12 @@ public:
     // fire-once [[pin]] marker state for donor slot assignment
     bool pin_armed = true;
     int  donor_slot = -1;
-    bool pending_pin_donor = false;
+    // minimum token count for a prompt to be pinned as a donor;
+    // if the pinned message has fewer tokens, the pin is deferred to the next prompt
+    int  pin_min_tokens = 1024;
+    // set when [[pin]] was found but the prompt was too small;
+    // carry forward to the next prompt that meets pin_min_tokens
+    bool pin_deferred = false;
     server_tokens donor_tokens;
 
     server_context_impl() {
@@ -4164,40 +4169,56 @@ private:
                                     SRV_ERR("pin path: donor_tokens empty but donor_slot=%d >= 0, skipping donor reuse\n", donor_slot);
                                 } else if (slot.mem.ctx_tgt == nullptr) {
                                     SRV_ERR("pin path: slot.mem.ctx_tgt null for slot.id=%d, donor_slot=%d, skipping seq_cp\n", slot.id, donor_slot);
-                                } else {
-                                     SRV_INF("pin path: donor reuse entry: donor_slot=%d, worker slot.id=%d, donor_tokens.size=%zu, input_tokens.size=%zu\n",
-                                             donor_slot, slot.id, donor_tokens.size(), input_tokens.size());
-                                     // require at least 2 matching tokens so that lcp_len - 1 >= 1 KV copy
-                                     const size_t lcp_threshold = 2;
-                                     const size_t lcp_len = donor_tokens.get_common_prefix(input_tokens);
-                                     SRV_INF("pin path: lcp_len=%zu (donor_tokens.size=%zu, threshold=%zu), current n_past=%d\n",
-                                            lcp_len, donor_tokens.size(), lcp_threshold, n_past);
-                                    if (lcp_len >= lcp_threshold && lcp_len > 0 && lcp_len > (size_t)n_past) {
-                                        // NOTE: when n_past > 0, the prompt cache already restored
-                                        // KV state and prompt tokens for a different prefix.
-                                        // seq_cp will overlay the donor's KV at positions [0, n_copy),
-                                        // but stale KV at positions beyond n_copy from the prompt
-                                        // cache restore may remain.
-                                        if (n_past > 0) {
-                                            SLT_INF(slot, "donor reuse: overriding prompt cache (n_past=%d -> lcp=%zu)\n", n_past, lcp_len);
-                                            slot.prompt.clear();
-                                        }
-                                        const size_t n_copy = lcp_len - 1; // leave 1 token for the worker
-                                        if (n_copy > 0) {
-                                            SRV_INF("pin path: about to seq_cp donor_slot=%d -> worker_slot=%d, n_copy=%zu, ctx_tgt=%p\n",
-                                                    donor_slot, slot.id, n_copy, (void *) ctx_tgt);
-                                            slot.mem.seq_cp(donor_slot, slot.id, 0, (llama_pos) n_copy);
-                                            SRV_INF("pin path: seq_cp completed, copying %zu tokens to prompt\n", n_copy);
-                                            for (size_t i = 0; i < n_copy; i++) {
-                                                slot.prompt.tokens.push_back(input_tokens[i]);
-                                            }
-                                        }
-                                        n_past = (int) n_copy;
-                                        SLT_INF(slot, "donor reuse: donor slot=%d, lcp=%zu, worker slot=%d\n",
-                                                donor_slot, lcp_len, slot.id);
-                                    } else if (n_past > 0 && (size_t)n_past >= lcp_len) {
-                                        SLT_INF(slot, "donor reuse: skipped, n_past=%d >= lcp=%zu\n", n_past, lcp_len);
-                                    }
+                                 } else {
+                                      SRV_DBG("pin path: donor reuse entry: donor_slot=%d, worker slot.id=%d, donor_tokens.size=%zu, input_tokens.size=%zu\n",
+                                              donor_slot, slot.id, donor_tokens.size(), input_tokens.size());
+                                      // require at least 2 matching tokens so that lcp_len - 1 >= 1 KV copy
+                                      const size_t lcp_threshold = 2;
+                                      const size_t lcp_len = donor_tokens.get_common_prefix(input_tokens);
+                                      SRV_DBG("pin path: lcp_len=%zu (donor_tokens.size=%zu, threshold=%zu), current n_past=%d\n",
+                                             lcp_len, donor_tokens.size(), lcp_threshold, n_past);
+                                      if (lcp_len >= lcp_threshold && lcp_len > 0 && lcp_len > (size_t)n_past) {
+                                          SRV_INF("pin path: donor reuse CACHE HIT, donor_slot=%d, lcp_len=%zu, n_past=%d\n",
+                                                  donor_slot, lcp_len, n_past);
+                                         // NOTE: when n_past > 0, the prompt cache already restored
+                                         // KV state and prompt tokens for a different prefix.
+                                         // seq_cp will overlay the donor's KV at positions [0, n_copy),
+                                         // but stale KV at positions beyond n_copy from the prompt
+                                         // cache restore may remain.
+                                         if (n_past > 0) {
+                                             SLT_INF(slot, "donor reuse: overriding prompt cache (n_past=%d -> lcp=%zu)\n", n_past, lcp_len);
+                                             slot.prompt.clear();
+                                         }
+                                          const size_t n_copy = lcp_len - 1; // leave 1 token for the worker
+                                          if (n_copy > 0) {
+                                              // n_past is the count of valid KV positions before donor reuse.
+                                              // capture it here because n_past is overwritten below.
+                                              const int n_past_before = n_past;
+                                              SLT_DBG(slot, "pin path: about to seq_cp donor_slot=%d -> worker_slot=%d, n_copy=%zu, ctx_tgt=%p\n",
+                                                      donor_slot, slot.id, n_copy, (void *) ctx_tgt);
+                                              slot.mem.seq_cp(donor_slot, slot.id, 0, (llama_pos) n_copy);
+                                              SLT_DBG(slot, "pin path: seq_cp completed, copying %zu tokens to prompt\n", n_copy);
+                                              // clear stale KV from a prior prompt cache restore that sits
+                                              // beyond the donor prefix. skip when n_past was 0: there is no
+                                              // prior KV to clear, and the seq_rm would also drop the donor's
+                                              // recurrent tail cell, leaving pos_min == -1 while n_past > 0
+                                              // (assertion failure at the pos_min check below).
+                                              if (n_past_before > 0) {
+                                                  SLT_INF(slot, "pin path: clearing stale KV at positions [%zu, %d) after donor reuse\n",
+                                                          n_copy, n_past_before);
+                                                  slot.mem.seq_rm(slot.id, n_copy, n_past_before);
+                                              }
+                                              for (size_t i = 0; i < n_copy; i++) {
+                                                  slot.prompt.tokens.push_back(input_tokens[i]);
+                                              }
+                                          }
+                                         n_past = (int) n_copy;
+                                         SLT_INF(slot, "donor reuse: CACHE HIT donor slot=%d, lcp=%zu, worker slot=%d, n_past=%d\n",
+                                                 donor_slot, lcp_len, slot.id, n_past);
+                                     } else {
+                                         SLT_INF(slot, "donor reuse: CACHE MISS, lcp_len=%zu < threshold=%zu or n_past=%d >= lcp=%zu\n",
+                                                 lcp_len, lcp_threshold, n_past, lcp_len);
+                                     }
                                 }
                             }
 
@@ -4715,10 +4736,33 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // snapshot slot ids for logging: only show count + first few to avoid log spam
+        int32_t n_slots_in_batch = batch.size() - off;
+        if (n_slots_in_batch > (int32_t) batch.tokens.size()) {
+            n_slots_in_batch = batch.tokens.size();
+        }
+        std::string batch_slot_preview;
+        for (int i = off; i < off + n_slots_in_batch && (int) batch_slot_preview.size() < 200; ++i) {
+            if (!batch_slot_preview.empty()) batch_slot_preview += ",";
+            batch_slot_preview += std::to_string(batch.tokens[i].id_slot);
+        }
+        if (n_slots_in_batch > 5) {
+            batch_slot_preview += "...";
+        }
+        // snapshot whether the batched slot requires embeddings; this value is
+        // captured before yield so it cannot be affected by concurrent state
+        const bool embeddings_needed = batch.slot_batched ? batch.slot_batched->need_embd() : false;
+        SRV_INF("pin path: decode batch n_slots=%d, slots=[%s], embeddings_needed=%d\n",
+                n_slots_in_batch, batch_slot_preview.c_str(), (int) embeddings_needed);
         queue_tasks.yield_to_queue([&]() {
-            // ensure embeddings is false right before evaluation: the worker thread
-            // may run concurrently during yield and could modify cparams.embeddings
-            llama_set_embeddings(ctx_tgt, false);
+            // set embeddings based on the snapshotted need_embd() value, not hardcoded false.
+            // previous approach reset to false unconditionally, but cparams.embeddings
+            // could still be true at the time llama_process reads it (race window
+            // between reset and balloc->init inside llama_context::decode).
+            // Using need_embd() ensures correctness for both generation and embedding
+            // batches, and the diagnostic in llama_batch_allocr::init will flag any
+            // leak that persists past this point.
+            llama_set_embeddings(ctx_tgt, embeddings_needed);
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -5375,15 +5419,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     try {
         std::vector<server_task> tasks;
 
-        // read and clear pending pin-donor flag (set by [[pin]] scanner in post_chat_completions)
-        SRV_INF("pin path: handle_completions_impl entry, pin_armed=%d, pending_pin_donor=%d\n",
-                (int) ctx_server.pin_armed, (int) ctx_server.pending_pin_donor);
-        const bool pin_donor = ctx_server.pending_pin_donor;
-        ctx_server.pending_pin_donor = false;
-        if (pin_donor) {
-            SRV_INF("%s", "pin path: pending_pin_donor read and cleared, will mark tasks with pin_donor=true\n");
+        // read and clear deferred pin flag (set by [[pin]] scanner in post_chat_completions)
+        SRV_INF("pin path: handle_completions_impl entry, pin_armed=%d, pin_deferred=%d\n",
+                (int) ctx_server.pin_armed, (int) ctx_server.pin_deferred);
+        const bool pin_requested = ctx_server.pin_deferred;
+        ctx_server.pin_deferred = false;
+        if (pin_requested) {
+            SRV_INF("pin path: pin_deferred read and cleared, will check token count against pin_min_tokens=%d\n",
+                    ctx_server.pin_min_tokens);
         } else {
-            SRV_INF("%s", "pin path: pending_pin_donor was false, no pin donor marking\n");
+            SRV_INF("%s", "pin path: pin_deferred was false, no pin donor marking\n");
         }
 
         const auto & prompt = data.at("prompt");
@@ -5409,6 +5454,25 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+        }
+
+        // if pin was requested, check whether any input meets the token threshold;
+        // if too small, defer to the next prompt
+        bool pin_donor = false;
+        if (pin_requested) {
+            size_t max_n_tokens = 0;
+            for (const auto & inp : inputs) {
+                max_n_tokens = std::max(max_n_tokens, inp.size());
+            }
+            if (max_n_tokens >= (size_t) ctx_server.pin_min_tokens) {
+                pin_donor = true;
+                SRV_INF("pin path: prompt has %zu tokens >= pin_min_tokens=%d, will mark donor\n",
+                        max_n_tokens, ctx_server.pin_min_tokens);
+            } else {
+                SRV_INF("pin path: prompt has %zu tokens < pin_min_tokens=%d, deferring pin to next prompt\n",
+                        max_n_tokens, ctx_server.pin_min_tokens);
+                ctx_server.pin_deferred = true;
+            }
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -6135,15 +6199,15 @@ void server_routes::init_routes() {
                     SRV_INF("[[pin]] found in %s message %zu, stripping marker (msg %s)\n",
                             msg_role.c_str(), i,
                             drop ? "dropped (empty after strip)" : "kept");
-                    SRV_INF("%s", "pin scan: setting pin_armed=false, about to set pending_pin_donor=true\n");
+                    SRV_INF("%s", "pin scan: setting pin_armed=false, about to set pin_deferred=true\n");
                     ctx_server.pin_armed = false;
-                    ctx_server.pending_pin_donor = true;
-                    SRV_INF("%s", "pin donor scheduled: pin_armed=false, pending_pin_donor=true\n");
+                    ctx_server.pin_deferred = true;
+                    SRV_INF("%s", "pin donor scheduled: pin_armed=false, pin_deferred=true\n");
                     break; // fire-once: stop scanning after first hit
                 }
             }
-            SRV_INF("pin scan: completed scanning, pin_armed=%d, pending_pin_donor=%d\n",
-                    (int) ctx_server.pin_armed, (int) ctx_server.pending_pin_donor);
+            SRV_INF("pin scan: completed scanning, pin_armed=%d, pin_deferred=%d\n",
+                    (int) ctx_server.pin_armed, (int) ctx_server.pin_deferred);
         }
 
         common_chat_session session;

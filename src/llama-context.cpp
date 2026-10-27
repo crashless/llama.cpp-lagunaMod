@@ -1613,8 +1613,17 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
     const int64_t n_vocab = model.vocab.n_tokens();
 
-    // note: during encode, we always output all tokens and skip position continuity checks (output_all=true)
-    if (!balloc->init(batch_inp, model.vocab, true)) {
+    // snapshot the embeddings flag at the start so concurrent writers cannot
+    // change it mid-batch and leak embeddings into a generation batch that was
+    // routed here via the decode() -> encode() redirect (e.g. DFlash models
+    // without a KV memory module). using the snapshot instead of a hardcoded
+    // true means the warning in llama_batch_allocr::init will still fire when
+    // a real leak reaches the batch layer, but decode batches routed through
+    // encode() will not force output_all=1 when the server has cleared it.
+    const bool output_all = cparams.embeddings;
+    LLAMA_LOG_DEBUG("%s: balloc->init caller=encode output_all=%d cparams.embeddings=%d this=%p cparams=%p n_tok=%zu\n",
+                    __func__, (int)output_all, (int)cparams.embeddings, (void*)this, (void*)&cparams, batch_inp.tokens.size());
+    if (!balloc->init(batch_inp, model.vocab, output_all, "encode", (uintptr_t)&cparams)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -1860,6 +1869,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
+
+    LLAMA_LOG_DEBUG("%s: balloc->init caller=decode output_all=%d cparams.embeddings=%d this=%p cparams=%p n_tok=%zu\n",
+                    __func__, (int)output_all, (int)cparams.embeddings, (void*)this, (void*)&cparams, batch_inp.tokens.size());
     // non-causal attention needs the whole sequence in one ubatch
     const bool embd_all     = output_all || !cparams.causal_attn;
     const bool has_samplers = !sampling.samplers.empty();
@@ -1894,7 +1906,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, output_all)) {
+    if (!balloc->init(batch_inp, vocab, output_all, "decode", (uintptr_t)&cparams)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -3854,7 +3866,7 @@ void llama_context::opt_epoch_iter(
         // TODO: use llama_batch_ext here
         {
             llama_batch_compat compat(this, batch);
-            if (!balloc->init(*compat.batch_ext, model.vocab, true)) {
+            if (!balloc->init(*compat.batch_ext, model.vocab, true, nullptr, (uintptr_t)&cparams)) {
                 LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
                 return;
             }

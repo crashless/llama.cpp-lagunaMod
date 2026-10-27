@@ -48,9 +48,9 @@ laguna.cpp is the only one that doesn't.
 **File:** `src/models/dflash.cpp` (both forks)
 
 **Poolside fork approach** -- two graph calls:
-1. `llana_encode(ctx_dft, enc_batch)` runs the encoder graph:
+1. `llama_encode(ctx_dft, enc_batch)` runs the encoder graph:
    `aux_norm` -> `fc` -> `output_norm_enc`
-2. `llana_decode(ctx_dft, batch_inject)` runs the decoder graph, projecting
+2. `llama_decode(ctx_dft, batch_inject)` runs the decoder graph, projecting
    K/V from already-fused features
 
 **LagunaMod fork approach** -- single graph call with inline fusion:
@@ -62,13 +62,13 @@ inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
 
 The `aux_norm` path exists in the encoder graph (`<true>`, lines 388-396) but
 `process()` never calls the encoder graph -- it goes straight to
-`llana_process` with `LLAMA_PROCESS_TYPE_DECODE`. Laguna's per-aux RMSNorm is
+`llama_process` with `LLAMA_PROCESS_TYPE_DECODE`. Laguna's per-aux RMSNorm is
 never applied to target features before fusion, degrading draft quality and
 acceptance rate.
 
 **Fix:** Either:
-- (a) Change `process()` back to the two-call pattern (`llana_encode` +
-      `llana_decode` with bulk memcpy), OR
+- (a) Change `process()` back to the two-call pattern (`llama_encode` +
+      `llama_decode` with bulk memcpy), OR
 - (b) Add the `aux_norm` block (reshape 3d -> rms_norm -> mul -> reshape 2d)
       before `build_lora_mm(model.fc, ...)` in the decoder's embd path,
       copying the exact pattern from the encoder graph (lines 388-396).
@@ -109,11 +109,11 @@ llama.cpp CUDA graph implementation, this can cause:
 
 **Poolside fork** (speculative.cpp:1108-1143) -- bulk copy, two calls:
 ```cpp
-llana_encode(ctx_dft, enc_batch);
-const float * inp_g = llana_get_embeddings_nextn(ctx_dft);
+llama_encode(ctx_dft, enc_batch);
+const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
 batch_inject.n_tokens = n_chunk;
 std::memcpy(batch_inject.embd, inp_g, n_chunk * n_embd_dec * sizeof(float));
-llana_decode(ctx_dft, batch_inject);
+llama_decode(ctx_dft, batch_inject);
 ```
 
 **LagunaMod fork** (speculative.cpp:1265-1276) -- per-token loop:
@@ -121,7 +121,7 @@ llana_decode(ctx_dft, batch_inject);
 for (int32_t i = 0; i < n_chunk; ++i) {
     batch_inject.add_embd({ features_buf.data() + i * n_embd_enc, 1, n_embd_enc }, pos_arr, seq_id, false);
 }
-llana_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
 ```
 
 The per-token `add_embd()` loop adds overhead for each token in the K/V
@@ -198,7 +198,7 @@ bool causal = false;
 if (llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
     causal = strcmp(buf, "laguna") == 0;
 }
-llana_set_causal_attn(ctx_dft, causal);
+llama_set_causal_attn(ctx_dft, causal);
 ```
 Sets causal=true for Laguna.
 
@@ -225,7 +225,7 @@ verification against the actual published GGUF metadata.
 | Priority | File | Fix |
 |----------|------|-----|
 | 1 | `src/models/laguna.cpp` | Add `res->t_h_nextn = cur;` before `build_norm` (line 337) |
-| 2 | `common/speculative.cpp` | Restore two-call pattern: `llana_encode` + `llana_decode` with bulk memcpy (lines 1265-1276) |
+| 2 | `common/speculative.cpp` | Restore two-call pattern: `llama_encode` + `llama_decode` with bulk memcpy (lines 1265-1276) |
 | 3 | `ggml/src/ggml-cuda/ggml-cuda.cu` | Change `GGML_CUDA_CC_VOLTA` to `GGML_CUDA_CC_AMPERE` (line 4798) |
 | 4 | `src/models/dflash.cpp` | If keeping inline fusion, add `aux_norm` block before `fc` in decoder embd path (line 900) |
 | 5 | `common/speculative.cpp` | Change non-finite sanitization to clamp to +/-65504 (line 1260) |
