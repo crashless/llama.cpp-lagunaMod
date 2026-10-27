@@ -3595,8 +3595,6 @@ private:
             }
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
-            SRV_INF("regular batch: embeddings=%d (need_embd=%d, slot=%d)\n",
-                    (int) slot_batched->need_embd(), (int) slot_batched->need_embd(), slot_batched->id);
         }
 
         int32_t off_next = 0;
@@ -3717,7 +3715,6 @@ private:
         // TTS sets embeddings=true for the whole context; reset to false so
         // the flag does not leak into regular generation batches.
         llama_set_embeddings(ctx_tgt, false);
-        SRV_INF("%s", "process_tts_slots: embeddings flag reset to false\n");
     }
 
     void pre_decode() {
@@ -4752,8 +4749,6 @@ private:
         // snapshot whether the batched slot requires embeddings; this value is
         // captured before yield so it cannot be affected by concurrent state
         const bool embeddings_needed = batch.slot_batched ? batch.slot_batched->need_embd() : false;
-        SRV_INF("pin path: decode batch n_slots=%d, slots=[%s], embeddings_needed=%d\n",
-                n_slots_in_batch, batch_slot_preview.c_str(), (int) embeddings_needed);
         queue_tasks.yield_to_queue([&]() {
             // set embeddings based on the snapshotted need_embd() value, not hardcoded false.
             // previous approach reset to false unconditionally, but cparams.embeddings
