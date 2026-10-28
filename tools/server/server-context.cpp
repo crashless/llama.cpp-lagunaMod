@@ -4187,31 +4187,56 @@ private:
                                              slot.prompt.clear();
                                          }
                                           const size_t n_copy = lcp_len - 1; // leave 1 token for the worker
-                                          if (n_copy > 0) {
-                                              // n_past is the count of valid KV positions before donor reuse.
-                                              // capture it here because n_past is overwritten below.
-                                              const int n_past_before = n_past;
-                                              SLT_DBG(slot, "pin path: about to seq_cp donor_slot=%d -> worker_slot=%d, n_copy=%zu, ctx_tgt=%p\n",
-                                                      donor_slot, slot.id, n_copy, (void *) ctx_tgt);
-                                              slot.mem.seq_cp(donor_slot, slot.id, 0, (llama_pos) n_copy);
-                                              SLT_DBG(slot, "pin path: seq_cp completed, copying %zu tokens to prompt\n", n_copy);
-                                              // clear stale KV from a prior prompt cache restore that sits
-                                              // beyond the donor prefix. skip when n_past was 0: there is no
-                                              // prior KV to clear, and the seq_rm would also drop the donor's
-                                              // recurrent tail cell, leaving pos_min == -1 while n_past > 0
-                                              // (assertion failure at the pos_min check below).
-                                              if (n_past_before > 0) {
-                                                  SLT_INF(slot, "pin path: clearing stale KV at positions [%zu, %d) after donor reuse\n",
-                                                          n_copy, n_past_before);
-                                                  slot.mem.seq_rm(slot.id, n_copy, n_past_before);
-                                              }
-                                              for (size_t i = 0; i < n_copy; i++) {
-                                                  slot.prompt.tokens.push_back(input_tokens[i]);
-                                              }
+                                           bool donor_accepted = false;
+                                           if (n_copy > 0) {
+                                               // n_past is the count of valid KV positions before donor reuse.
+                                               // capture it here because n_past is overwritten conditionally below.
+                                               const int n_past_before = n_past;
+                                               SLT_DBG(slot, "pin path: about to seq_cp donor_slot=%d -> worker_slot=%d, n_copy=%zu, ctx_tgt=%p\n",
+                                                       donor_slot, slot.id, n_copy, (void *) ctx_tgt);
+                                               slot.mem.seq_cp(donor_slot, slot.id, 0, (llama_pos) n_copy);
+                                               SLT_DBG(slot, "pin path: seq_cp completed, copying %zu tokens to prompt\n", n_copy);
+                                               // clear stale KV from a prior prompt cache restore that sits
+                                               // beyond the donor prefix. skip when n_past was 0: there is no
+                                               // prior KV to clear, and the seq_rm would also drop the donor's
+                                               // recurrent tail cell, leaving pos_min == -1 while n_past > 0
+                                               // (assertion failure at the pos_min check below).
+                                               if (n_past_before > 0) {
+                                                   SLT_INF(slot, "pin path: clearing stale KV at positions [%zu, %d) after donor reuse\n",
+                                                           n_copy, n_past_before);
+                                                   slot.mem.seq_rm(slot.id, n_copy, n_past_before);
+                                               }
+                                               // decide n_past from the resident SWA cells, not from n_copy.
+                                               // the donor's SWA cache may have evicted positions outside its
+                                               // window, so seq_cp may attach no cells at all.
+                                               const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                               const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                                               if (pos_min < 0) {
+                                                   // no resident cells attached -- do not claim the prefix
+                                                   SLT_INF(slot, "donor reuse: no resident SWA cells for lcp=%zu, falling back\n", lcp_len);
+                                               } else if (n_swa > 0 && pos_min > pos_max - n_swa + 1) {
+                                                   // resident range is shorter than the SWA window
+                                                   SLT_INF(slot, "donor reuse: resident SWA window too short (pos_min=%d, pos_max=%d, n_swa=%d) for lcp=%zu, falling back\n",
+                                                          pos_min, pos_max, n_swa, lcp_len);
+                                               } else {
+                                                   // clamp to the furthest position the SWA cache actually retains
+                                                   const int n_past_clamped = (int) std::min((llama_pos) n_copy, pos_max);
+                                                   if (n_past_clamped <= n_past_before) {
+                                                       SLT_INF(slot, "donor reuse: clamped n_past=%d <= n_past_before=%d for lcp=%zu, falling back\n",
+                                                              n_past_clamped, n_past_before, lcp_len);
+                                                   } else {
+                                                       n_past = n_past_clamped;
+                                                       for (size_t i = 0; i < (size_t) n_past; i++) {
+                                                           slot.prompt.tokens.push_back(input_tokens[i]);
+                                                       }
+                                                       donor_accepted = true;
+                                                   }
+                                               }
+                                           }
+                                          if (donor_accepted) {
+                                          SLT_INF(slot, "donor reuse: CACHE HIT donor slot=%d, lcp=%zu -> n_past=%d (clamped from %zu), worker slot=%d\n",
+                                                  donor_slot, lcp_len, n_past, n_copy, slot.id);
                                           }
-                                         n_past = (int) n_copy;
-                                         SLT_INF(slot, "donor reuse: CACHE HIT donor slot=%d, lcp=%zu, worker slot=%d, n_past=%d\n",
-                                                 donor_slot, lcp_len, slot.id, n_past);
                                      } else {
                                          SLT_INF(slot, "donor reuse: CACHE MISS, lcp_len=%zu < threshold=%zu or n_past=%d >= lcp=%zu\n",
                                                  lcp_len, lcp_threshold, n_past, lcp_len);

@@ -106,15 +106,16 @@ public:
                          bool   unified,
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
-                     uint32_t   n_pad,
-                     uint32_t   n_swa,
-               llama_swa_type   swa_type,
-               llama_memory_t   mem_other,
-        const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share,
-        // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                  uint32_t   n_pad,
+                  uint32_t   n_swa,
+                llama_swa_type   swa_type,
+                llama_memory_t   mem_other,
+         const layer_filter_cb & filter,
+         const  layer_reuse_cb & reuse,
+         const  layer_share_cb & share,
+         // a model can hold more than one cache, so the tensor names have to stay unique
+                  const char *   name_tag = "",
+                  uint32_t   n_ubatch = 0);
 
     ~llama_kv_cache() = default;
 
@@ -276,6 +277,13 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    // per-sequence span for the SWA pool (kv_unified only)
+    // when active, each seq_id owns a contiguous [base, base+swa_span) range
+    // and the ring-cursor is per-sequence instead of shared
+    uint32_t swa_span = 0;
+    bool     swa_per_seq = false;
+    std::vector<uint32_t> v_heads_seq; // [LLAMA_MAX_SEQ], used when swa_per_seq
 
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;

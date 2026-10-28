@@ -65,21 +65,22 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
-                ggml_type   type_k,
-                ggml_type   type_v,
-                     bool   v_trans,
-                     bool   offload,
-                     bool   unified,
-                 uint32_t   kv_size,
-                 uint32_t   n_seq_max,
-                 uint32_t   n_pad,
-                 uint32_t   n_swa,
-           llama_swa_type   swa_type,
-           llama_memory_t   mem_other,
-    const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share,
-             const char *   name_tag) :
+                 ggml_type   type_k,
+                 ggml_type   type_v,
+                      bool   v_trans,
+                      bool   offload,
+                      bool   unified,
+                  uint32_t   kv_size,
+                  uint32_t   n_seq_max,
+                  uint32_t   n_pad,
+                  uint32_t   n_swa,
+            llama_swa_type   swa_type,
+            llama_memory_t   mem_other,
+     const layer_filter_cb & filter,
+     const  layer_reuse_cb & reuse,
+     const  layer_share_cb & share,
+              const char *   name_tag,
+                  uint32_t   n_ubatch) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -142,6 +143,27 @@ llama_kv_cache::llama_kv_cache(
     v_cells.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].resize(kv_size);
+    }
+
+    // per-sequence spans for the SWA cache (kv_unified only)
+    // gives each seq_id a fixed contiguous [base, base+swa_span) range so
+    // that a long-running sequence's cells stay packed (no scatter across the
+    // shared ring), keeping the FA gather kernel streaming
+    if (n_swa > 0 && n_ubatch > 0 && n_stream == 1) {
+        swa_span = GGML_PAD(n_swa + n_ubatch, 256);
+        const uint32_t needed = n_seq_max * swa_span;
+        if (kv_size >= needed) {
+            swa_per_seq = true;
+            v_heads_seq.resize(LLAMA_MAX_SEQ);
+            for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                v_heads_seq[s] = s * swa_span;
+            }
+            LLAMA_LOG_INFO("%s: SWA per-seq spans enabled, span = %u, n_seq_max = %u\n",
+                           __func__, swa_span, n_seq_max);
+        } else {
+            LLAMA_LOG_ERROR("%s: SWA cache pool (%u) too small for %u per-seq spans of %u cells each (need %u), falling back to shared ring\n",
+                            __func__, kv_size, n_seq_max, swa_span, needed);
+        }
     }
 
     // by default, all sequence ids are mapped to the 0th stream
@@ -394,6 +416,12 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    if (swa_per_seq) {
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            v_heads_seq[s] = s * swa_span;
+        }
+    }
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -420,24 +448,28 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
     if (seq_id >= 0) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
-        auto & head  = v_heads[seq_to_stream[seq_id]];
+        auto & head  = swa_per_seq ? v_heads_seq[seq_id] : v_heads[seq_to_stream[seq_id]];
 
-        uint32_t new_head = cells.size();
+        // per-seq span: only scan within the sequence's own range
+        const uint32_t scan_base = swa_per_seq ? (uint32_t) seq_id * swa_span : 0;
+        const uint32_t scan_end  = swa_per_seq ? scan_base + swa_span : cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        uint32_t new_head = scan_end;
+
+        for (uint32_t i = scan_base; i < scan_end; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
 
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
+                if (new_head == scan_end) {
                     new_head = i;
                 }
             }
         }
 
         // If we freed up a slot, set head to it so searching can start there.
-        if (new_head != cells.size() && new_head < head) {
+        if (new_head != scan_end && new_head < head) {
             head = new_head;
         }
     } else {
@@ -571,20 +603,24 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
-    auto & head  = v_heads[seq_to_stream[seq_id]];
+    auto & head  = swa_per_seq ? v_heads_seq[seq_id] : v_heads[seq_to_stream[seq_id]];
 
-    uint32_t new_head = cells.size();
+    // per-seq span: only scan within the sequence's own range
+    const uint32_t scan_base = swa_per_seq ? (uint32_t) seq_id * swa_span : 0;
+    const uint32_t scan_end  = swa_per_seq ? scan_base + swa_span : cells.size();
 
-    for (uint32_t i = 0; i < cells.size(); ++i) {
+    uint32_t new_head = scan_end;
+
+    for (uint32_t i = scan_base; i < scan_end; ++i) {
         if (cells.seq_keep(i, seq_id)) {
-            if (new_head == cells.size()) {
+            if (new_head == scan_end) {
                 new_head = i;
             }
         }
     }
 
     // If we freed up a slot, set head to it so searching can start there.
-    if (new_head != cells.size() && new_head < head) {
+    if (new_head != scan_end && new_head < head) {
         head = new_head;
     }
 }
@@ -599,7 +635,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
-    auto & head  = v_heads[seq_to_stream[seq_id]];
+    auto & head  = swa_per_seq ? v_heads_seq[seq_id] : v_heads[seq_to_stream[seq_id]];
 
     if (shift == 0) {
         return;
@@ -620,14 +656,18 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
-    for (uint32_t i = 0; i < cells.size(); ++i) {
+    // per-seq span: only scan within the sequence's own range
+    const uint32_t scan_base = swa_per_seq ? (uint32_t) seq_id * swa_span : 0;
+    const uint32_t scan_end  = swa_per_seq ? scan_base + swa_span : cells.size();
+
+    for (uint32_t i = scan_base; i < scan_end; ++i) {
         if (!cells.pos_in(i, p0, p1)) {
             continue;
         }
 
         if (cells.seq_has(i, seq_id)) {
             if (cells.pos_add(i, shift)) {
-                if (new_head == cells.size()) {
+                if (new_head == scan_end) {
                     new_head = i;
                 }
             }
@@ -636,7 +676,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
-    head = new_head != cells.size() ? new_head : 0;
+    head = new_head != scan_end ? new_head : scan_base;
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -1018,16 +1058,20 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
-        uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+        // per-seq span bounds (shared ring when swa_per_seq is false)
+        const uint32_t span_base = swa_per_seq ? (uint32_t) seq_id * swa_span : 0;
+        const uint32_t span_end  = swa_per_seq ? span_base + swa_span : cells.size();
+
+        uint32_t head_cur = swa_per_seq ? v_heads_seq[seq_id] : v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
-        if (head_cur > cells.get_used() + 2*n_tokens) {
+        if (!swa_per_seq && head_cur > cells.get_used() + 2*n_tokens) {
             head_cur = 0;
         }
 
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+        if (n_tokens > (span_end - span_base)) {
+            LLAMA_LOG_ERROR("%s: n_tokens = %d > span = %u\n", __func__, n_tokens, span_end - span_base);
             return { };
         }
 
@@ -1038,9 +1082,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const uint32_t n_test = cont ? n_tokens : 1;
 
         while (true) {
-            if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
-                head_cur = 0;
+            if (head_cur + n_test > span_end) {
+                n_tested += span_end - head_cur;
+                head_cur = span_base;
                 continue;
             }
 
@@ -1097,7 +1141,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 res.idxs[s].clear();
             }
 
-            if (n_tested >= cells.size()) {
+            if (n_tested >= (span_end - span_base)) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                 return { };
             }
@@ -1201,9 +1245,19 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     // move the head at the end of the slot
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        auto & head = v_heads[sinfo.strm[s]];
-
-        head = sinfo.idxs[s].back() + 1;
+        if (swa_per_seq) {
+            // in the unified SWA cache, the ubatch has one seq (n_seqs == 1)
+            const llama_seq_id seq_id = ubatch.seq_id_unq[0];
+            const uint32_t span_base = seq_id * swa_span;
+            uint32_t new_head = sinfo.idxs[s].back() + 1;
+            if (new_head >= span_base + swa_span) {
+                new_head = span_base;
+            }
+            v_heads_seq[seq_id] = new_head;
+        } else {
+            auto & head = v_heads[sinfo.strm[s]];
+            head = sinfo.idxs[s].back() + 1;
+        }
     }
 }
 
